@@ -1,0 +1,441 @@
+---------create table and insert data----------
+CREATE TABLE events (
+    event_id UInt64,
+    user_id UInt32,
+    event_date Date,
+    event_time DateTime,
+    event_type String,
+    revenue Decimal(10,2)
+) ENGINE = MergeTree
+ORDER BY (event_date, user_id);
+
+INSERT INTO events
+SELECT number, rand() % 100000, today() - (rand() % 90), now() - (rand() % 1000000),
+       ['click','view','purchase','signup'][(rand() % 4) + 1], rand() % 5000 / 100
+FROM numbers(10000000);
+
+--------------------------------------------------------
+Phase 1 — Storage/Ingestion Engines
+
+Goal: Prove how ClickHouse handles different ingestion patterns, and why some approaches are safer than others for production.
+
+1.1 Memory Engine
+
+Objective: Show RAM-only storage behavior and its limitation (no persistence).
+Steps:
+
+CREATE TABLE lookup_demo (id UInt32, name String) ENGINE = Memory;
+
+INSERT INTO lookup_demo VALUES (1, 'INR'), (2, 'USD'), (3, 'EUR');
+
+SELECT * FROM lookup_demo;
+
+Success criteria: Table works instantly, zero disk usage. Documented caveat (not tested live): restarting the server would wipe this table — explain verbally, no need to actually restart your box for this.
+
+RESULT (actually run):
+CREATE TABLE lookup_demo (id UInt32, name String) ENGINE = Memory;  -- Ok, 0.006 sec
+INSERT INTO lookup_demo VALUES (1, 'INR'), (2, 'USD'), (3, 'EUR');  -- Ok, 0.053 sec
+SELECT * FROM lookup_demo;
+   id | name
+   1  | INR
+   2  | USD
+   3  | EUR
+-- 3 rows, Elapsed: 0.001 sec (instant, pure RAM read)
+----------------------------------------------------------
+1.2 Buffer Engine
+
+Objective: Prove RAM buffering + read-your-own-write + flush behavior, and its limitations.
+Steps: (as already planned — create events_buffer, insert 500 rows, check count before/after flush, check part-count impact)
+Success criteria: Buffer shows new rows before events does; OPTIMIZE TABLE flushes them; limitations (no index, restart data loss) documented even if not destructively tested.
+
+CREATE TABLE events_buffer AS events
+ENGINE = Buffer(default, events, 16, 10, 100, 10000, 1000000, 10000000, 100000000);
+
+
+Then from bash:
+
+time for i in $(seq 1 500); do
+  clickhouse-client --password=default --query \
+    "INSERT INTO events_buffer VALUES ($i, $((RANDOM%1000)), today(), now(), 'click', 1.5)"
+done
+
+Then back in clickhouse-client:
+-- check immediately, before any flush
+SELECT count() FROM events_buffer;
+SELECT count() FROM events;
+
+-- Force to flush the results in table event
+OPTIMIZE TABLE events_buffer
+
+-- Check active parts of the table events
+SELECT table, count() AS parts FROM system.parts WHERE table='events' AND active GROUP BY table
+
+
+Performing it proves you understand the actual mechanics — the timing windows, the flush triggers, the read-before-write behavior — well enough to predict what should happen and verify it actually happened
+
+
+RESULTS (actually run):
+Baseline before test: SELECT count() FROM events -> 10,000,499
+
+500-row insert loop:
+real    0m55.898s
+
+Immediately after insert (before flush):
+SELECT count() FROM events_buffer -> 10,000,999
+SELECT count() FROM events         -> 10,000,499  (unchanged -- proves read-before-flush)
+
+After OPTIMIZE TABLE events_buffer:
+SELECT count() FROM events -> 10,000,999  (matches buffer -- flush confirmed)
+
+Part count after flush:
+events | 7 parts
+---------------------------------------------------------
+1.3 Async Insert
+
+Objective: Prove async insert reduces part fragmentation vs. plain inserts, for the same workload.
+Steps: 500 plain inserts → check part count → 500 async inserts → check part count again.
+Success criteria: Fewer parts created per row inserted via async insert vs. plain insert; both timed with time.
+
+
+This is the comparison point — same 500-row workload, but using the modern recommended approach instead of Buffer.
+
+Step 1 — capture baseline again (since the buffer flush changed your count):
+
+clickhouse-client --password=default --query "SELECT count() FROM events"
+
+Step 2 — run 500 inserts with async insert enabled:
+
+time for i in $(seq 1 500); do
+  clickhouse-client --password=default --query \
+    "INSERT INTO events SETTINGS async_insert=1, wait_for_async_insert=1 VALUES ($i, $((RANDOM%1000)), today(), now(), 'click', 1.5)"
+done
+
+
+Step 3 — check the new count and part count:
+
+clickhouse-client --password=default --query "SELECT count() FROM events"
+
+clickhouse-client --password=default --query \
+  "SELECT table, count() AS parts FROM system.parts WHERE table='events' AND active GROUP BY table"
+
+
+Async Insert — Brief Explanation
+What it is:
+
+A setting in ClickHouse that changes how INSERT statements are handled on the server side. Instead of immediately writing each INSERT to disk as its own file, the server holds incoming rows in a memory buffer for a short time, then writes many small inserts together as one larger batch.
+What it does, step by step:
+
+Client sends an INSERT (even just 1 row)
+Server doesn't write it to disk right away — it adds it to an in-memory buffer
+Server waits briefly (controlled by async_insert_busy_timeout_ms, default ~200ms) or until the buffer reaches a size limit
+Server then writes everything collected into one disk part, instead of one part per insert
+
+Why we use it:
+
+The core problem it solves is "too many small parts." ClickHouse is built for large, infrequent writes — not thousands of tiny ones. If many small INSERTs each create their own part, the server gets overloaded with file management (merging, indexing) and performance degrades, sometimes causing the cluster to throttle or reject inserts ("too many parts" error).
+Async insert fixes this by letting the server do the batching automatically, instead of requiring the application/client to batch rows manually before sending them.
+Where it matters in practice:
+
+High-frequency, small-row ingestion — IoT sensors, application logs, event tracking, telemetry — anywhere many independent sources are each sending small amounts of data continuously, rather than one process sending large bulk loads.
+One important setting to know:
+
+wait_for_async_insert controls durability:
+
+=1 (safe, default-recommended): client waits until the buffered data is actually flushed to disk before confirming success
+=0 (faster, riskier): client gets an immediate "OK" even though data is still only in memory — if the server crashes before flushing, that acknowledged data is silently lost
+
+
+
+RESULTS (actually run):
+Baseline: SELECT count() FROM events -> 10,000,999
+
+500-row async insert loop:
+real    0m56.752s
+
+After insert:
+SELECT count() FROM events -> 10,001,499  (+500, correct)
+Part count: events | 7  (no fragmentation)
+
+NOTE: Both Buffer and Async Insert showed similar timing (~56s) and identical
+part counts in this test. This is because the test used 500 sequential
+clickhouse-client invocations, where process-startup overhead dominates --
+this masks the real-world throughput difference Async Insert is designed to
+show under concurrent, high-frequency load.
+
+---------------------------------------------------------
+
+Phase 2 — Caching Mechanisms
+
+First step: Mark Cache
+
+SYSTEM DROP MARK CACHE;
+
+SELECT event_type, count(), sum(revenue) FROM events
+WHERE event_date = today() - 5
+GROUP BY event_type;
+
+SELECT event, value FROM system.events
+WHERE event IN ('MarkCacheHits','MarkCacheMisses');
+
+Run the identical SELECT event_type... query again, then re-check the counter query:
+
+SELECT event_type, count(), sum(revenue) FROM events
+WHERE event_date = today() - 5
+GROUP BY event_type;
+
+SELECT event, value FROM system.events
+WHERE event IN ('MarkCacheHits','MarkCacheMisses');
+
+ip-172-31-12-152.ap-south-1.compute.internal :) SELECT event, value FROM system.events
+WHERE event IN ('MarkCacheHits','MarkCacheMisses');
+
+SELECT
+    event,
+    value
+FROM system.events
+WHERE event IN ('MarkCacheHits', 'MarkCacheMisses')
+
+Query id: 4ca3b49b-4fc2-43e4-b08f-ad63abf362e8
+
+   ┌─event───────────┬─value─┐
+1. │ MarkCacheHits   │    29 │
+2. │ MarkCacheMisses │    24 │
+   └─────────────────┴───────┘
+
+2 rows in set. Elapsed: 0.002 sec.
+
+
+Mark Cache — What It Is and Why We Use It
+The problem it solves:
+
+ClickHouse stores table data in column files on disk, sorted by your ORDER BY key (in your case, event_date, user_id). To quickly find which part of those files contains the rows you're looking for — without scanning the entire file — ClickHouse keeps small index files called "marks." Think of marks like a book's index: instead of reading every page to find a topic, you jump straight to the right page number.
+What a "mark" actually is:
+
+A mark is a small entry that says: "for this range of the primary key, the actual data starts at this byte offset in the column file." Every table has a .mrk file per column holding thousands of these entries.
+The cache itself:
+
+Reading those .mrk files from disk, every single time, for every query, is wasteful — they don't change unless the table's data structure changes. So ClickHouse keeps recently-used marks in RAM. That RAM area is the Mark Cache.
+Why this matters for performance:
+
+Without the mark cache, every query — even one that only touches a tiny slice of data — pays a "where do I look" disk-read cost before it even starts reading actual data. With the cache warm, that lookup step is skipped on repeat queries, especially valuable for dashboards or reports that get queried repeatedly with similar filters.
+
+
+RESULTS (actually run, 3 separate sessions, all consistent):
+
+Run 1 (after SYSTEM DROP MARK CACHE):
+2 rows, Elapsed: 0.009 sec
+MarkCacheHits = 13, MarkCacheMisses = 24
+
+Run 2 (identical query repeated):
+2 rows, Elapsed: 0.007 sec
+MarkCacheHits = 29 (+16), MarkCacheMisses = 24 (unchanged)
+
+Pattern reproduced identically in two earlier test sessions:
+  16 -> 44 (+16 hits, misses flat)
+  117 -> 133 (+16 hits, misses flat)
+
+
+
+----------------------------------------------------------
+
+Uncompressed Cache
+
+This cache is disabled by default, so we enable it explicitly first.
+
+SET use_uncompressed_cache = 1;
+
+SYSTEM DROP UNCOMPRESSED CACHE;
+
+SELECT event_type, count(), sum(revenue) FROM events
+WHERE event_date = today() - 5
+GROUP BY event_type
+SETTINGS use_uncompressed_cache = 1;
+
+SELECT event, value FROM system.events
+WHERE event IN ('UncompressedCacheHits','UncompressedCacheMisses');
+
+Run that block first and note the result. Then run the identical query again, followed by the counter check again:
+
+SELECT event_type, count(), sum(revenue) FROM events
+WHERE event_date = today() - 5
+GROUP BY event_type
+SETTINGS use_uncompressed_cache = 1;
+
+SELECT event, value FROM system.events
+WHERE event IN ('UncompressedCacheHits','UncompressedCacheMisses');
+
+Uncompressed cache is disabled by default because it trades RAM for speed in a very specific scenario — repeated access to the same small dataset. When we turned it on and ran the same query twice, the second run was 8 times faster, because the data didn't need to be decompressed again. This makes it a good fit for small, frequently-revisited datasets like recent-hours hot data or lookup tables — but not something you'd blanket-enable for an entire large analytical table, since the RAM cost would outweigh the benefit for data that's rarely re-read
+
+Why It's OFF by Default (this is the important part)
+This is the opposite tradeoff from Mark Cache. Three real reasons:
+1. It's expensive in RAM, fast or not
+
+Decompressed data is much bigger than compressed data — often 3-6x larger. Caching it means committing serious RAM to hold relatively little data. Mark cache, by comparison, caches tiny index entries — cheap to keep around. Uncompressed cache is "expensive rent for the space it takes."
+2. It only helps a specific, narrow pattern
+
+It's only worth it when: the same data gets read repeatedly, AND the working set is small enough to actually fit in RAM. Most analytical queries in ClickHouse scan large, varied ranges of data — a different slice every time — so caching "the last thing read" rarely gets reused before something else evicts it. ClickHouse's own design philosophy assumes large scans are the norm, not small repeated point-lookups, so the engine doesn't waste RAM on this by default.
+3. Decompression itself is already fast
+
+Modern compression algorithms like LZ4 are deliberately chosen for speed, not maximum compression ratio. The CPU cost of decompressing on every read is often cheaper than the complexity of maintaining a cache for it. So the "problem" this cache solves is smaller to begin with compared to Mark Cache's problem (disk seeks).
+Bottom line: Mark Cache is "always a good idea, cheap to keep on." Uncompressed Cache is "situational — only worth it for specific small, hot, frequently-repeated datasets," which is exactly why ClickHouse makes you opt in explicitly rather than enabling it for everyone by default.
+
+
+RESULTS (actually run):
+
+Run 1 (cold, after SYSTEM DROP UNCOMPRESSED CACHE):
+2 rows, Elapsed: 0.057 sec
+UncompressedCacheMisses = 57 (no Hits row yet)
+
+Run 2 (identical query repeated):
+2 rows, Elapsed: 0.007 sec   <-- 8x faster
+UncompressedCacheHits = 57, UncompressedCacheMisses = 57 (unchanged)
+
+CONCLUSION: 100% of needed data blocks were already decompressed in RAM
+on the second run -- zero new misses, full reuse.
+-------------------------------------------------------------------------
+
+Query Cache-
+
+SET use_query_cache = 0;  -- reset first, avoid the 				session-bleed issue from before
+
+SELECT event_type, count() FROM events GROUP BY event_type
+SETTINGS use_query_cache = 1;
+
+SELECT event_type, count() FROM events GROUP BY event_type
+SETTINGS use_query_cache = 1;
+
+SELECT query, stale, result_size, expires_at FROM system.query_cache;
+
+
+
+RESULTS (actually run):
+
+Run 1 (cold):
+4 rows, Elapsed: 0.078 sec, Processed 10.00 million rows, 87.49 MB
+
+system.query_cache check:
+  stale=0, result_size=768 bytes, expires_at = +60 sec from run time
+
+Run 2 (identical query repeated):
+4 rows, Elapsed: 0.001 sec   <-- 78x faster
+
+CONCLUSION: Entire query result served from a 768-byte cached object instead
+of re-scanning 87MB of data. This is the single largest speedup of any test
+in this PoC -- because it skips the scan AND the aggregation, not just one
+step.
+-----------------------------------------------------------------
+Query Condition Cache
+
+SET use_query_condition_cache = 1;
+
+SELECT count() FROM events WHERE user_id = 42 AND event_type = 'purchase'
+SETTINGS use_query_condition_cache = 1;
+
+Run it, then run the identical query again:
+
+SELECT count() FROM events WHERE user_id = 42 AND event_type = 'purchase'
+SETTINGS use_query_condition_cache = 1;
+
+Then check:
+SELECT event, value FROM system.events
+WHERE event LIKE 'QueryConditionCache%';
+
+
+Query Condition Cache makes repeated lookups on the same filter condition progressively cheaper by remembering which chunks of data are worth checking — without freezing the answer in time the way a full result cache does. Running the identical filter twice cut the amount of data scanned by more than half.
+
+
+
+RESULTS (actually run):
+
+Run 1 (cold):
+count() = 102, Elapsed: 0.017 sec, Processed 2.95 million rows
+
+Run 2 (identical query repeated):
+count() = 102, Elapsed: 0.013 sec, Processed 1.38 million rows  <-- 53% fewer rows scanned
+
+Counter check:
+QueryConditionCacheHits = 9, QueryConditionCacheMisses = 70
+
+CONCLUSION: Repeating the same filter cut data scanned by more than half,
+while still returning a live (not frozen) answer -- unlike Query Cache,
+this stays correct even if new matching data arrives between runs.
+----------------------------------------------------------------
+Phase 3 = Projections
+
+Step 1 — Baseline (no projection yet)
+
+SELECT event_type, count(), sum(revenue) FROM events
+GROUP BY event_type;
+
+Step 2 — Create the projection
+ALTER TABLE events ADD PROJECTION event_type_summary (
+    SELECT event_type, count() AS cnt, sum(revenue) AS total_revenue
+    GROUP BY event_type
+);
+
+Step 3 — Materialize it (backfill for existing 10M+ rows)
+ALTER TABLE events MATERIALIZE PROJECTION event_type_summary;
+
+This one might take a few seconds since it's building the projection across your whole table — that's expected, not an error.
+
+Step 4 — Confirm it actually built
+SELECT table, name, part_name, rows, marks, bytes_on_disk
+FROM system.projection_parts
+WHERE table = 'events';
+
+
+Why We Need This At All
+Without a projection, every time someone runs "give me totals by event_type," ClickHouse re-reads and re-aggregates all 10 million raw rows — every single time, even though the answer to "totals by event_type" barely changes between queries if no new data has arrived. The projection means that work gets done once, automatically, as data is inserted — and every subsequent identical query reads a few hundred bytes of pre-computed summary instead of scanning megabytes of raw data.
+
+We haven't yet confirmed ClickHouse actually uses this projection automatically. Let's check now:
+
+SELECT event_type, count(), sum(revenue) FROM events
+GROUP BY event_type;
+
+SELECT event_type, count(), sum(revenue) FROM events
+GROUP BY event_type;
+
+Run that exact same query again, and note whether Processed rows drops dramatically from 10 million.
+
+EXPLAIN SELECT event_type, count(), sum(revenue) FROM events
+GROUP BY event_type;
+
+
+RESULTS (actually run):
+
+Baseline (before projection):
+4 rows, Elapsed: 0.116 sec, Processed 10.00 million rows, 167.52 MB
+
+system.projection_parts after MATERIALIZE:
+  4 parts with 4 summary rows each (one per event_type)
+  1 part with 1 summary row (the Buffer-engine test part, all 'click' type)
+  -> confirms projection correctly reflects actual part contents
+
+After projection (same query, run twice):
+4 rows, Elapsed: 0.004 sec   <-- 29x faster, both runs
+
+EXPLAIN output (definitive proof):
+  Expression ((Project names + Projection))
+    Aggregating
+      Expression
+        ReadFromMergeTree (event_type_summary)   <-- confirms projection was used,
+                                                       not the 10M-row base table
+
+CONCLUSION: ClickHouse automatically selected the projection with zero query
+--------------------------------------------------------------
+BUSINESS IMPACT SUMMARY
+
+- Faster repeated queries (Query Cache: 78x, Projections: 29x) mean dashboards
+  and reports return near-instantly on repeat views -- faster decisions for
+  anyone using the data.
+- Caching mechanisms reduce repeated compute cost on the same hardware --
+  lower infrastructure spend as query volume grows.
+- Async Insert and Buffer Engine prevent ingestion-side instability under
+  high-frequency small writes, protecting the system from the "too many
+  parts" failure mode as data volume scales.
+- All mechanisms are native to ClickHouse -- no external cache (e.g. Redis)
+  required, no additional infrastructure to maintain.
+
+
+
+
